@@ -1,0 +1,13 @@
+# samsungipcd modem, handled by the samsungipcd ModemManager plugin: the AT
+# port ttyp0 (legacy pty slave; samsungipcd runs on the master /dev/ptyp0)
+# plus the modem driver's network interface rmnet0 as the data port (static
+# IP, no PPP). Read by ModemManager itself (built without udev), whose parser
+# takes matches plus exactly one result per line: one ENV{} assignment, GOTO
+# or LABEL.
+
+SUBSYSTEM=="tty", KERNEL=="ttyp0", ENV{ID_MM_PHYSDEV_UID}="samsungipcd"
+SUBSYSTEM=="tty", KERNEL=="ttyp0", ENV{ID_MM_SAMSUNGIPCD}="1"
+SUBSYSTEM=="tty", KERNEL=="ttyp0", ENV{ID_MM_PORT_TYPE_AT_PRIMARY}="1"
+
+SUBSYSTEM=="net", KERNEL=="rmnet0", ENV{ID_MM_PHYSDEV_UID}="samsungipcd"
+SUBSYSTEM=="net", KERNEL=="rmnet0", ENV{ID_MM_SAMSUNGIPCD}="1"

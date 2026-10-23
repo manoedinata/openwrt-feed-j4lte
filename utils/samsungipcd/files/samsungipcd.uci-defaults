@@ -1,0 +1,21 @@
+#!/bin/sh
+# Mobile data interface for the samsungipcd modem: ModemManager names the
+# modem by the uid its rules file gives it ("samsungipcd"). The APN is the
+# one the J4 was set up with (Telkomsel); change it in /etc/config/network.
+
+uci -q get network.wwan >/dev/null && exit 0
+
+uci -q batch <<'EOT'
+set network.wwan=interface
+set network.wwan.proto='modemmanager'
+set network.wwan.device='samsungipcd'
+set network.wwan.apn='internet'
+set network.wwan.iptype='ipv4'
+commit network
+EOT
+
+# masquerade it like any other uplink
+zone=$(uci show firewall | sed -n "s/^firewall\.\(@zone\[[0-9]*\]\)\.name='wan'$/\1/p")
+[ -n "$zone" ] && uci add_list "firewall.$zone.network=wwan" && uci commit firewall
+
+exit 0
