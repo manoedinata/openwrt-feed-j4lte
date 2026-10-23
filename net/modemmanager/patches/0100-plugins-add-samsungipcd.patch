@@ -1,0 +1,839 @@
+From: Hendra Manudinata <manoedinata@gmail.com>
+Subject: [PATCH] plugins: add samsungipcd
+
+Plugin for Samsung IPC modems behind the samsungipcd proxy (Galaxy J4,
+Shannon SS305AP): AT over the proxy's tty, packet data over the modem
+driver's rmnet0 with a static IP from AT+CGCONTRDP, no PPP. The ports
+are virtual and are matched by the ID_MM_SAMSUNGIPCD tag that
+samsungipcd's rules file sets.
+
+Ported from the ModemManager 1.14 plugin (mm-plugin-samsungipcd/ in
+github.com/Manoedinata/debian_j4lte) to the 1.24 built-in plugin API.
+
+diff --git a/meson.build b/meson.build
+index 4cccc00..3427dec 100644
+--- a/meson.build
++++ b/meson.build
+@@ -358,6 +358,7 @@ plugins_options_reqs = {
+   'quectel': {'available': true, 'shared': ['quectel']},
+   'rolling': {'available': true, 'shared': ['fibocom']},
+   'samsung': {'available': true, 'shared': ['icera']},
++  'samsungipcd': {'available': true, 'shared': []},
+   'sierra-legacy': {'available': true, 'shared': ['icera', 'sierra']},
+   'sierra': {'available': true, 'shared': ['xmm']},
+   'simtech': {'available': true, 'shared': []},
+diff --git a/meson_options.txt b/meson_options.txt
+index c0609fe..85e3701 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -58,6 +58,7 @@ option('plugin_pantech', type: 'feature', value: 'auto', description: 'enable pa
+ option('plugin_qcom_soc', type: 'feature', value: 'auto', description: 'enable qcom soc plugin support')
+ option('plugin_quectel', type: 'feature', value: 'auto', description: 'enable quectel plugin support')
+ option('plugin_rolling', type: 'feature', value: 'auto', description: 'enable rolling plugin support')
++option('plugin_samsungipcd', type: 'feature', value: 'auto', description: 'enable samsungipcd plugin support')
+ option('plugin_samsung', type: 'feature', value: 'auto', description: 'enable samsung plugin support')
+ option('plugin_sierra_legacy', type: 'feature', value: 'auto', description: 'enable sierra legacy plugin support')
+ option('plugin_sierra', type: 'feature', value: 'auto', description: 'enable sierra plugin support')
+diff --git a/src/plugins/meson.build b/src/plugins/meson.build
+index b21b5e3..61f145c 100644
+--- a/src/plugins/meson.build
++++ b/src/plugins/meson.build
+@@ -878,6 +878,22 @@ if plugins_options['rolling']
+   plugins_udev_rules += files('rolling/77-mm-rolling-port-types.rules')
+ endif
+ 
++# plugin: samsungipcd (Samsung IPC modems behind the samsungipcd proxy)
++if plugins_options['samsungipcd']
++  common_c_args = ['-DMM_MODULE_NAME="samsungipcd"']
++
++  sources = files(
++    'samsungipcd/mm-broadband-bearer-samsungipcd.c',
++    'samsungipcd/mm-broadband-modem-samsungipcd.c',
++    'samsungipcd/mm-plugin-samsungipcd.c',
++  )
++
++  plugins += {'plugin-samsungipcd': {
++    'plugin': true,
++    'module': {'sources': sources, 'include_directories': plugins_incs, 'c_args': common_c_args},
++  }}
++endif
++
+ # plugin: samsung
+ if plugins_options['samsung']
+   sources = files(
+diff --git a/src/plugins/mm-builtin-plugins.c b/src/plugins/mm-builtin-plugins.c
+index c7f9163..694f72c 100644
+--- a/src/plugins/mm-builtin-plugins.c
++++ b/src/plugins/mm-builtin-plugins.c
+@@ -112,6 +112,9 @@ MMPlugin *mm_plugin_create_rolling (void);
+ #if defined ENABLE_PLUGIN_SAMSUNG
+ MMPlugin *mm_plugin_create_samsung (void);
+ #endif
++#if defined ENABLE_PLUGIN_SAMSUNGIPCD
++MMPlugin *mm_plugin_create_samsungipcd (void);
++#endif
+ #if defined ENABLE_PLUGIN_SIERRA
+ MMPlugin *mm_plugin_create_sierra (void);
+ #endif
+@@ -250,6 +253,9 @@ mm_builtin_plugins_load (void)
+ #if defined ENABLE_PLUGIN_SAMSUNG
+     PREPEND_PLUGIN (samsung);
+ #endif
++#if defined ENABLE_PLUGIN_SAMSUNGIPCD
++    PREPEND_PLUGIN (samsungipcd);
++#endif
+ #if defined ENABLE_PLUGIN_SIERRA
+     PREPEND_PLUGIN (sierra);
+ #endif
+diff --git a/src/plugins/samsungipcd/mm-broadband-bearer-samsungipcd.c b/src/plugins/samsungipcd/mm-broadband-bearer-samsungipcd.c
+new file mode 100644
+index 0000000..c6f985e
+--- /dev/null
++++ b/src/plugins/samsungipcd/mm-broadband-bearer-samsungipcd.c
+@@ -0,0 +1,445 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * GPL-2.0-or-later, see mm-plugin-samsungipcd.c
++ *
++ * Bearer for samsungipcd: ordinary 3GPP packet data over the modem's own
++ * network interface (rmnet0), without PPP.
++ *
++ *   dial:       AT+CGACT=1,<cid>   (answers OK when the session is up)
++ *   ip config:  AT+CGCONTRDP=<cid> (address, DNS; static configuration)
++ *   disconnect: AT+CGACT=0,<cid>
++ *
++ * The first activation after samsungipcd started can fail while the modem
++ * re-registers, so the dial is retried a few times.
++ */
++
++#include <config.h>
++
++#include <string.h>
++#include <arpa/inet.h>
++
++#include <ModemManager.h>
++#define _LIBMM_INSIDE_MM
++#include <libmm-glib.h>
++
++#include "mm-base-modem-at.h"
++#include "mm-broadband-bearer-samsungipcd.h"
++#include "mm-log-object.h"
++#include "mm-modem-helpers.h"
++
++G_DEFINE_TYPE (MMBroadbandBearerSamsungipcd, mm_broadband_bearer_samsungipcd, MM_TYPE_BROADBAND_BEARER)
++
++#define DIAL_ATTEMPTS        3
++#define CGACT_TIMEOUT_SECS   35  /* samsungipcd answers ERROR after 25 s */
++
++/*****************************************************************************/
++/* 3GPP dialing (sub-step of the 3GPP connection sequence) */
++
++typedef struct {
++    MMBaseModem    *modem;
++    MMPortSerialAt *primary;
++    guint           cid;
++    MMPort         *data;
++    guint           attempt;
++} DialContext;
++
++static void
++dial_context_free (DialContext *ctx)
++{
++    g_clear_object (&ctx->data);
++    g_clear_object (&ctx->primary);
++    g_clear_object (&ctx->modem);
++    g_slice_free (DialContext, ctx);
++}
++
++static MMPort *
++dial_3gpp_finish (MMBroadbandBearer  *self,
++                  GAsyncResult       *res,
++                  GError            **error)
++{
++    return MM_PORT (g_task_propagate_pointer (G_TASK (res), error));
++}
++
++static void dial_activate (GTask *task);
++
++static void
++dial_activate_ready (MMBaseModem  *modem,
++                     GAsyncResult *res,
++                     GTask        *task)
++{
++    DialContext *ctx;
++    GError      *error = NULL;
++
++    ctx = g_task_get_task_data (task);
++
++    if (!mm_base_modem_at_command_full_finish (modem, res, &error)) {
++        if (ctx->attempt < DIAL_ATTEMPTS && !g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
++            mm_obj_dbg (g_task_get_source_object (task),
++                        "activation attempt %u/%u failed: %s, retrying",
++                        ctx->attempt, DIAL_ATTEMPTS, error->message);
++            g_error_free (error);
++            dial_activate (task);
++            return;
++        }
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    g_task_return_pointer (task, g_object_ref (ctx->data), g_object_unref);
++    g_object_unref (task);
++}
++
++static void
++dial_activate (GTask *task)
++{
++    DialContext *ctx;
++    gchar       *cmd;
++
++    ctx = g_task_get_task_data (task);
++    ctx->attempt++;
++
++    cmd = g_strdup_printf ("+CGACT=1,%u", ctx->cid);
++    mm_base_modem_at_command_full (ctx->modem,
++                                   MM_IFACE_PORT_AT (ctx->primary),
++                                   cmd,
++                                   CGACT_TIMEOUT_SECS,
++                                   FALSE,
++                                   FALSE, /* raw */
++                                   g_task_get_cancellable (task),
++                                   (GAsyncReadyCallback) dial_activate_ready,
++                                   task);
++    g_free (cmd);
++}
++
++static void
++dial_3gpp (MMBroadbandBearer   *self,
++           MMBaseModem         *modem,
++           MMPortSerialAt      *primary,
++           guint                cid,
++           GCancellable        *cancellable,
++           GAsyncReadyCallback  callback,
++           gpointer             user_data)
++{
++    GTask       *task;
++    DialContext *ctx;
++
++    g_assert (primary != NULL);
++
++    task = g_task_new (self, cancellable, callback, user_data);
++
++    ctx = g_slice_new0 (DialContext);
++    ctx->modem   = g_object_ref (modem);
++    ctx->primary = g_object_ref (primary);
++    ctx->cid     = cid;
++    g_task_set_task_data (task, ctx, (GDestroyNotify) dial_context_free);
++
++    /* The data goes through the modem's network interface */
++    ctx->data = mm_base_modem_get_best_data_port (modem, MM_PORT_TYPE_NET);
++    if (!ctx->data) {
++        g_task_return_new_error (task,
++                                 MM_CORE_ERROR,
++                                 MM_CORE_ERROR_NOT_FOUND,
++                                 "No valid data port found to launch connection");
++        g_object_unref (task);
++        return;
++    }
++
++    dial_activate (task);
++}
++
++/*****************************************************************************/
++/* IP config retrieval (sub-step of the 3GPP connection sequence) */
++
++typedef struct {
++    MMBaseModem      *modem;
++    MMPort           *data;
++    MMBearerIpFamily  family;
++} GetIpConfigContext;
++
++static void
++get_ip_config_context_free (GetIpConfigContext *ctx)
++{
++    g_clear_object (&ctx->data);
++    g_clear_object (&ctx->modem);
++    g_slice_free (GetIpConfigContext, ctx);
++}
++
++static gboolean
++get_ip_config_3gpp_finish (MMBroadbandBearer   *self,
++                           GAsyncResult        *res,
++                           MMBearerIpConfig   **ipv4_config,
++                           MMBearerIpConfig   **ipv6_config,
++                           GError             **error)
++{
++    MMBearerConnectResult *configs;
++    MMBearerIpConfig      *ipv4, *ipv6;
++
++    configs = g_task_propagate_pointer (G_TASK (res), error);
++    if (!configs)
++        return FALSE;
++
++    ipv4 = mm_bearer_connect_result_peek_ipv4_config (configs);
++    ipv6 = mm_bearer_connect_result_peek_ipv6_config (configs);
++    g_assert (ipv4 || ipv6);
++    if (ipv4_config && ipv4)
++        *ipv4_config = g_object_ref (ipv4);
++    if (ipv6_config && ipv6)
++        *ipv6_config = g_object_ref (ipv6);
++
++    mm_bearer_connect_result_unref (configs);
++    return TRUE;
++}
++
++/* "255.255.255.255" -> 32 */
++static guint
++netmask_to_prefix (const gchar *mask)
++{
++    struct in_addr addr;
++    guint32        value;
++    guint          bits = 0;
++
++    if (!mask || !mask[0] || inet_pton (AF_INET, mask, &addr) != 1)
++        return 32; /* point to point link: the modem gives no mask */
++
++    for (value = ntohl (addr.s_addr); value & 0x80000000u; value <<= 1)
++        bits++;
++    return bits;
++}
++
++static gboolean
++usable_address (const gchar *str)
++{
++    return str && str[0] && g_strcmp0 (str, "0.0.0.0") != 0;
++}
++
++static void
++get_ip_config_ready (MMBaseModem  *modem,
++                     GAsyncResult *res,
++                     GTask        *task)
++{
++    GetIpConfigContext    *ctx;
++    const gchar           *response;
++    GError                *error = NULL;
++    gchar                 *address = NULL;
++    gchar                 *subnet = NULL;
++    gchar                 *gateway = NULL;
++    gchar                 *dns1 = NULL;
++    gchar                 *dns2 = NULL;
++    MMBearerIpConfig      *ipv4_config;
++    MMBearerConnectResult *connect_result;
++    const gchar           *dns[3] = { NULL, NULL, NULL };
++    guint                  n_dns = 0;
++
++    ctx = g_task_get_task_data (task);
++
++    response = mm_base_modem_at_command_full_finish (modem, res, &error);
++    if (!response) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    if (!mm_3gpp_parse_cgcontrdp_response (response, NULL, NULL, NULL,
++                                           &address, &subnet, &gateway, &dns1, &dns2,
++                                           &error)) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    if (!usable_address (address)) {
++        g_task_return_new_error (task,
++                                 MM_CORE_ERROR,
++                                 MM_CORE_ERROR_FAILED,
++                                 "Couldn't get IP config: no address in '%s'",
++                                 response);
++        goto out;
++    }
++
++    if (!(ctx->family & (MM_BEARER_IP_FAMILY_IPV4 | MM_BEARER_IP_FAMILY_IPV4V6))) {
++        g_task_return_new_error (task,
++                                 MM_CORE_ERROR,
++                                 MM_CORE_ERROR_UNSUPPORTED,
++                                 "Only IPv4 is supported");
++        goto out;
++    }
++
++    ipv4_config = mm_bearer_ip_config_new ();
++    mm_bearer_ip_config_set_method  (ipv4_config, MM_BEARER_IP_METHOD_STATIC);
++    mm_bearer_ip_config_set_address (ipv4_config, address);
++    mm_bearer_ip_config_set_prefix  (ipv4_config, netmask_to_prefix (subnet));
++    if (usable_address (gateway))
++        mm_bearer_ip_config_set_gateway (ipv4_config, gateway);
++    if (usable_address (dns1))
++        dns[n_dns++] = dns1;
++    if (usable_address (dns2) && g_strcmp0 (dns2, dns1) != 0)
++        dns[n_dns++] = dns2;
++    if (n_dns)
++        mm_bearer_ip_config_set_dns (ipv4_config, dns);
++
++    connect_result = mm_bearer_connect_result_new (ctx->data, ipv4_config, NULL);
++    g_task_return_pointer (task, connect_result, (GDestroyNotify) mm_bearer_connect_result_unref);
++    g_object_unref (ipv4_config);
++
++out:
++    g_object_unref (task);
++    g_free (address);
++    g_free (subnet);
++    g_free (gateway);
++    g_free (dns1);
++    g_free (dns2);
++}
++
++static void
++get_ip_config_3gpp (MMBroadbandBearer   *self,
++                    MMBroadbandModem    *modem,
++                    MMPortSerialAt      *primary,
++                    MMPortSerialAt      *secondary,
++                    MMPort              *data,
++                    guint                cid,
++                    MMBearerIpFamily     ip_family,
++                    GAsyncReadyCallback  callback,
++                    gpointer             user_data)
++{
++    GetIpConfigContext *ctx;
++    GTask              *task;
++    gchar              *cmd;
++
++    ctx = g_slice_new0 (GetIpConfigContext);
++    ctx->modem  = g_object_ref (MM_BASE_MODEM (modem));
++    ctx->data   = g_object_ref (data);
++    ctx->family = ip_family;
++
++    task = g_task_new (self, NULL, callback, user_data);
++    g_task_set_task_data (task, ctx, (GDestroyNotify) get_ip_config_context_free);
++
++    cmd = g_strdup_printf ("+CGCONTRDP=%u", cid);
++    mm_base_modem_at_command_full (MM_BASE_MODEM (modem),
++                                   MM_IFACE_PORT_AT (primary),
++                                   cmd,
++                                   10,
++                                   FALSE,
++                                   FALSE, /* raw */
++                                   NULL, /* cancellable */
++                                   (GAsyncReadyCallback) get_ip_config_ready,
++                                   task);
++    g_free (cmd);
++}
++
++/*****************************************************************************/
++/* 3GPP disconnect */
++
++static gboolean
++disconnect_3gpp_finish (MMBroadbandBearer  *self,
++                        GAsyncResult       *res,
++                        GError            **error)
++{
++    return g_task_propagate_boolean (G_TASK (res), error);
++}
++
++static void
++disconnect_ready (MMBaseModem  *modem,
++                  GAsyncResult *res,
++                  GTask        *task)
++{
++    GError *error = NULL;
++
++    /* A modem that is no longer connected answers ERROR; that is the state
++     * we want, so do not make a failure out of it */
++    if (!mm_base_modem_at_command_full_finish (modem, res, &error)) {
++        mm_obj_dbg (g_task_get_source_object (task), "deactivation reported: %s", error->message);
++        g_error_free (error);
++    }
++
++    g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++static void
++disconnect_3gpp (MMBroadbandBearer   *self,
++                 MMBroadbandModem    *modem,
++                 MMPortSerialAt      *primary,
++                 MMPortSerialAt      *secondary,
++                 MMPort              *data,
++                 guint                cid,
++                 GAsyncReadyCallback  callback,
++                 gpointer             user_data)
++{
++    GTask *task;
++    gchar *cmd;
++
++    g_assert (primary != NULL);
++
++    task = g_task_new (self, NULL, callback, user_data);
++
++    cmd = g_strdup_printf ("+CGACT=0,%u", cid);
++    mm_base_modem_at_command_full (MM_BASE_MODEM (modem),
++                                   MM_IFACE_PORT_AT (primary),
++                                   cmd,
++                                   15,
++                                   FALSE,
++                                   FALSE, /* raw */
++                                   NULL, /* cancellable */
++                                   (GAsyncReadyCallback) disconnect_ready,
++                                   task);
++    g_free (cmd);
++}
++
++/*****************************************************************************/
++
++MMBaseBearer *
++mm_broadband_bearer_samsungipcd_new_finish (GAsyncResult  *res,
++                                            GError       **error)
++{
++    GObject *bearer;
++    GObject *source;
++
++    source = g_async_result_get_source_object (res);
++    bearer = g_async_initable_new_finish (G_ASYNC_INITABLE (source), res, error);
++    g_object_unref (source);
++
++    if (!bearer)
++        return NULL;
++
++    /* Only export valid bearers */
++    mm_base_bearer_export (MM_BASE_BEARER (bearer));
++
++    return MM_BASE_BEARER (bearer);
++}
++
++void
++mm_broadband_bearer_samsungipcd_new (MMBroadbandModemSamsungipcd *modem,
++                                     MMBearerProperties          *config,
++                                     GCancellable                *cancellable,
++                                     GAsyncReadyCallback          callback,
++                                     gpointer                     user_data)
++{
++    g_async_initable_new_async (
++        MM_TYPE_BROADBAND_BEARER_SAMSUNGIPCD,
++        G_PRIORITY_DEFAULT,
++        cancellable,
++        callback,
++        user_data,
++        MM_BASE_BEARER_MODEM,  modem,
++        MM_BASE_BEARER_CONFIG, config,
++        NULL);
++}
++
++static void
++mm_broadband_bearer_samsungipcd_init (MMBroadbandBearerSamsungipcd *self)
++{
++}
++
++static void
++mm_broadband_bearer_samsungipcd_class_init (MMBroadbandBearerSamsungipcdClass *klass)
++{
++    MMBroadbandBearerClass *broadband_bearer_class = MM_BROADBAND_BEARER_CLASS (klass);
++
++    broadband_bearer_class->dial_3gpp                 = dial_3gpp;
++    broadband_bearer_class->dial_3gpp_finish          = dial_3gpp_finish;
++    broadband_bearer_class->get_ip_config_3gpp        = get_ip_config_3gpp;
++    broadband_bearer_class->get_ip_config_3gpp_finish = get_ip_config_3gpp_finish;
++    broadband_bearer_class->disconnect_3gpp           = disconnect_3gpp;
++    broadband_bearer_class->disconnect_3gpp_finish    = disconnect_3gpp_finish;
++}
+diff --git a/src/plugins/samsungipcd/mm-broadband-bearer-samsungipcd.h b/src/plugins/samsungipcd/mm-broadband-bearer-samsungipcd.h
+new file mode 100644
+index 0000000..da08aac
+--- /dev/null
++++ b/src/plugins/samsungipcd/mm-broadband-bearer-samsungipcd.h
+@@ -0,0 +1,46 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * GPL-2.0-or-later, see mm-plugin-samsungipcd.c
++ */
++
++#ifndef MM_BROADBAND_BEARER_SAMSUNGIPCD_H
++#define MM_BROADBAND_BEARER_SAMSUNGIPCD_H
++
++#include <glib.h>
++#include <glib-object.h>
++
++#define _LIBMM_INSIDE_MM
++#include <libmm-glib.h>
++
++#include "mm-broadband-bearer.h"
++#include "mm-broadband-modem-samsungipcd.h"
++
++#define MM_TYPE_BROADBAND_BEARER_SAMSUNGIPCD            (mm_broadband_bearer_samsungipcd_get_type ())
++#define MM_BROADBAND_BEARER_SAMSUNGIPCD(obj)            (G_TYPE_CHECK_INSTANCE_CAST ((obj), MM_TYPE_BROADBAND_BEARER_SAMSUNGIPCD, MMBroadbandBearerSamsungipcd))
++#define MM_BROADBAND_BEARER_SAMSUNGIPCD_CLASS(klass)    (G_TYPE_CHECK_CLASS_CAST ((klass),  MM_TYPE_BROADBAND_BEARER_SAMSUNGIPCD, MMBroadbandBearerSamsungipcdClass))
++#define MM_IS_BROADBAND_BEARER_SAMSUNGIPCD(obj)         (G_TYPE_CHECK_INSTANCE_TYPE ((obj), MM_TYPE_BROADBAND_BEARER_SAMSUNGIPCD))
++#define MM_IS_BROADBAND_BEARER_SAMSUNGIPCD_CLASS(klass) (G_TYPE_CHECK_CLASS_TYPE ((klass),  MM_TYPE_BROADBAND_BEARER_SAMSUNGIPCD))
++#define MM_BROADBAND_BEARER_SAMSUNGIPCD_GET_CLASS(obj)  (G_TYPE_INSTANCE_GET_CLASS ((obj),  MM_TYPE_BROADBAND_BEARER_SAMSUNGIPCD, MMBroadbandBearerSamsungipcdClass))
++
++typedef struct _MMBroadbandBearerSamsungipcd MMBroadbandBearerSamsungipcd;
++typedef struct _MMBroadbandBearerSamsungipcdClass MMBroadbandBearerSamsungipcdClass;
++
++struct _MMBroadbandBearerSamsungipcd {
++    MMBroadbandBearer parent;
++};
++
++struct _MMBroadbandBearerSamsungipcdClass {
++    MMBroadbandBearerClass parent;
++};
++
++GType mm_broadband_bearer_samsungipcd_get_type (void);
++
++void          mm_broadband_bearer_samsungipcd_new        (MMBroadbandModemSamsungipcd *modem,
++                                                          MMBearerProperties          *config,
++                                                          GCancellable                *cancellable,
++                                                          GAsyncReadyCallback          callback,
++                                                          gpointer                     user_data);
++MMBaseBearer *mm_broadband_bearer_samsungipcd_new_finish (GAsyncResult *res,
++                                                          GError      **error);
++
++#endif /* MM_BROADBAND_BEARER_SAMSUNGIPCD_H */
+diff --git a/src/plugins/samsungipcd/mm-broadband-modem-samsungipcd.c b/src/plugins/samsungipcd/mm-broadband-modem-samsungipcd.c
+new file mode 100644
+index 0000000..6acd80f
+--- /dev/null
++++ b/src/plugins/samsungipcd/mm-broadband-modem-samsungipcd.c
+@@ -0,0 +1,101 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * GPL-2.0-or-later, see mm-plugin-samsungipcd.c
++ */
++
++#include <config.h>
++
++#include <ModemManager.h>
++#define _LIBMM_INSIDE_MM
++#include <libmm-glib.h>
++
++#include "mm-iface-modem.h"
++#include "mm-broadband-modem-samsungipcd.h"
++#include "mm-broadband-bearer-samsungipcd.h"
++#include "mm-log-object.h"
++
++static void iface_modem_init (MMIfaceModemInterface *iface);
++
++G_DEFINE_TYPE_EXTENDED (MMBroadbandModemSamsungipcd, mm_broadband_modem_samsungipcd, MM_TYPE_BROADBAND_MODEM, 0,
++                        G_IMPLEMENT_INTERFACE (MM_TYPE_IFACE_MODEM, iface_modem_init))
++
++/*****************************************************************************/
++/* Create Bearer (Modem interface) */
++
++static MMBaseBearer *
++modem_create_bearer_finish (MMIfaceModem  *self,
++                            GAsyncResult  *res,
++                            GError       **error)
++{
++    return g_task_propagate_pointer (G_TASK (res), error);
++}
++
++static void
++broadband_bearer_new_ready (GObject      *source,
++                            GAsyncResult *res,
++                            GTask        *task)
++{
++    MMBaseBearer *bearer;
++    GError       *error = NULL;
++
++    bearer = mm_broadband_bearer_samsungipcd_new_finish (res, &error);
++    if (!bearer)
++        g_task_return_error (task, error);
++    else
++        g_task_return_pointer (task, bearer, g_object_unref);
++    g_object_unref (task);
++}
++
++static void
++modem_create_bearer (MMIfaceModem        *self,
++                     MMBearerProperties  *properties,
++                     GAsyncReadyCallback  callback,
++                     gpointer             user_data)
++{
++    mm_obj_dbg (self, "creating samsungipcd bearer...");
++    mm_broadband_bearer_samsungipcd_new (MM_BROADBAND_MODEM_SAMSUNGIPCD (self),
++                                         properties,
++                                         NULL, /* cancellable */
++                                         (GAsyncReadyCallback) broadband_bearer_new_ready,
++                                         g_task_new (self, NULL, callback, user_data));
++}
++
++/*****************************************************************************/
++
++MMBroadbandModemSamsungipcd *
++mm_broadband_modem_samsungipcd_new (const gchar  *device,
++                                    const gchar  *physdev,
++                                    const gchar **drivers,
++                                    const gchar  *plugin,
++                                    guint16       vendor_id,
++                                    guint16       product_id)
++{
++    return g_object_new (MM_TYPE_BROADBAND_MODEM_SAMSUNGIPCD,
++                         MM_BASE_MODEM_DEVICE,     device,
++                         MM_BASE_MODEM_PHYSDEV,    physdev,
++                         MM_BASE_MODEM_DRIVERS,    drivers,
++                         MM_BASE_MODEM_PLUGIN,     plugin,
++                         MM_BASE_MODEM_VENDOR_ID,  vendor_id,
++                         MM_BASE_MODEM_PRODUCT_ID, product_id,
++                         /* data goes through rmnet0 (static IP), not PPP */
++                         MM_BASE_MODEM_DATA_NET_SUPPORTED, TRUE,
++                         MM_BASE_MODEM_DATA_TTY_SUPPORTED, FALSE,
++                         NULL);
++}
++
++static void
++iface_modem_init (MMIfaceModemInterface *iface)
++{
++    iface->create_bearer        = modem_create_bearer;
++    iface->create_bearer_finish = modem_create_bearer_finish;
++}
++
++static void
++mm_broadband_modem_samsungipcd_init (MMBroadbandModemSamsungipcd *self)
++{
++}
++
++static void
++mm_broadband_modem_samsungipcd_class_init (MMBroadbandModemSamsungipcdClass *klass)
++{
++}
+diff --git a/src/plugins/samsungipcd/mm-broadband-modem-samsungipcd.h b/src/plugins/samsungipcd/mm-broadband-modem-samsungipcd.h
+new file mode 100644
+index 0000000..3a68205
+--- /dev/null
++++ b/src/plugins/samsungipcd/mm-broadband-modem-samsungipcd.h
+@@ -0,0 +1,38 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * GPL-2.0-or-later, see mm-plugin-samsungipcd.c
++ */
++
++#ifndef MM_BROADBAND_MODEM_SAMSUNGIPCD_H
++#define MM_BROADBAND_MODEM_SAMSUNGIPCD_H
++
++#include "mm-broadband-modem.h"
++
++#define MM_TYPE_BROADBAND_MODEM_SAMSUNGIPCD            (mm_broadband_modem_samsungipcd_get_type ())
++#define MM_BROADBAND_MODEM_SAMSUNGIPCD(obj)            (G_TYPE_CHECK_INSTANCE_CAST ((obj), MM_TYPE_BROADBAND_MODEM_SAMSUNGIPCD, MMBroadbandModemSamsungipcd))
++#define MM_BROADBAND_MODEM_SAMSUNGIPCD_CLASS(klass)    (G_TYPE_CHECK_CLASS_CAST ((klass),  MM_TYPE_BROADBAND_MODEM_SAMSUNGIPCD, MMBroadbandModemSamsungipcdClass))
++#define MM_IS_BROADBAND_MODEM_SAMSUNGIPCD(obj)         (G_TYPE_CHECK_INSTANCE_TYPE ((obj), MM_TYPE_BROADBAND_MODEM_SAMSUNGIPCD))
++#define MM_IS_BROADBAND_MODEM_SAMSUNGIPCD_CLASS(klass) (G_TYPE_CHECK_CLASS_TYPE ((klass),  MM_TYPE_BROADBAND_MODEM_SAMSUNGIPCD))
++#define MM_BROADBAND_MODEM_SAMSUNGIPCD_GET_CLASS(obj)  (G_TYPE_INSTANCE_GET_CLASS ((obj),  MM_TYPE_BROADBAND_MODEM_SAMSUNGIPCD, MMBroadbandModemSamsungipcdClass))
++
++typedef struct _MMBroadbandModemSamsungipcd MMBroadbandModemSamsungipcd;
++typedef struct _MMBroadbandModemSamsungipcdClass MMBroadbandModemSamsungipcdClass;
++
++struct _MMBroadbandModemSamsungipcd {
++    MMBroadbandModem parent;
++};
++
++struct _MMBroadbandModemSamsungipcdClass {
++    MMBroadbandModemClass parent;
++};
++
++GType mm_broadband_modem_samsungipcd_get_type (void);
++
++MMBroadbandModemSamsungipcd *mm_broadband_modem_samsungipcd_new (const gchar  *device,
++                                                                 const gchar  *physdev,
++                                                                 const gchar **drivers,
++                                                                 const gchar  *plugin,
++                                                                 guint16       vendor_id,
++                                                                 guint16       product_id);
++
++#endif /* MM_BROADBAND_MODEM_SAMSUNGIPCD_H */
+diff --git a/src/plugins/samsungipcd/mm-plugin-samsungipcd.c b/src/plugins/samsungipcd/mm-plugin-samsungipcd.c
+new file mode 100644
+index 0000000..faafc50
+--- /dev/null
++++ b/src/plugins/samsungipcd/mm-plugin-samsungipcd.c
+@@ -0,0 +1,92 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++/*
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details:
++ *
++ * Plugin for the modem proxy samsungipcd (Samsung IPC modems, e.g. Shannon).
++ * Modelled on the MBM plugin.
++ */
++
++#include <string.h>
++#include <gmodule.h>
++
++#define _LIBMM_INSIDE_MM
++#include <libmm-glib.h>
++
++#include "mm-plugin-common.h"
++#include "mm-broadband-modem-samsungipcd.h"
++
++#define MM_TYPE_PLUGIN_SAMSUNGIPCD mm_plugin_samsungipcd_get_type ()
++MM_DEFINE_PLUGIN (SAMSUNGIPCD, samsungipcd, Samsungipcd)
++
++/*****************************************************************************/
++
++static MMBaseModem *
++create_modem (MMPlugin     *self,
++              const gchar  *uid,
++              const gchar  *physdev,
++              const gchar **drivers,
++              guint16       vendor,
++              guint16       product,
++              guint16       subsystem_vendor,
++              guint16       subsystem_device,
++              GList        *probes,
++              GError      **error)
++{
++    return MM_BASE_MODEM (mm_broadband_modem_samsungipcd_new (uid,
++                                                              physdev,
++                                                              drivers,
++                                                              mm_plugin_get_name (self),
++                                                              vendor,
++                                                              product));
++}
++
++/*****************************************************************************/
++
++MM_PLUGIN_NAMED_CREATOR_SCOPE MMPlugin *
++mm_plugin_create_samsungipcd (void)
++{
++    /* The ports are not recognised by vendor or product (they are virtual
++     * ttys plus the modem's rmnet interface), a udev rule has to tag them. */
++    static const gchar *subsystems[] = { "tty", "net", NULL };
++    static const gchar *udev_tags[] = {
++        "ID_MM_SAMSUNGIPCD",
++        NULL
++    };
++
++    return MM_PLUGIN (
++        g_object_new (MM_TYPE_PLUGIN_SAMSUNGIPCD,
++                      MM_PLUGIN_NAME,               MM_MODULE_NAME,
++                      MM_PLUGIN_ALLOWED_SUBSYSTEMS, subsystems,
++                      MM_PLUGIN_ALLOWED_UDEV_TAGS,  udev_tags,
++                      MM_PLUGIN_ALLOWED_AT,         TRUE,
++                      /* The ports are virtual and have no kernel driver. Without
++                       * these three the port check would insist on finding a driver
++                       * name and filter every port. Nothing here is a QMI, MBIM or
++                       * XMM RPC modem, the udev tag decides which ports reach this
++                       * plugin. */
++                      MM_PLUGIN_ALLOWED_QMI,        TRUE,
++                      MM_PLUGIN_ALLOWED_MBIM,       TRUE,
++                      MM_PLUGIN_ALLOWED_XMMRPC,     TRUE,
++                      NULL));
++}
++
++static void
++mm_plugin_samsungipcd_init (MMPluginSamsungipcd *self)
++{
++}
++
++static void
++mm_plugin_samsungipcd_class_init (MMPluginSamsungipcdClass *klass)
++{
++    MMPluginClass *plugin_class = MM_PLUGIN_CLASS (klass);
++
++    plugin_class->create_modem = create_modem;
++}
