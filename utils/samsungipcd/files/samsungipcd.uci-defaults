@@ -11,6 +11,9 @@ set network.wwan.proto='modemmanager'
 set network.wwan.device='samsungipcd'
 set network.wwan.apn='internet'
 set network.wwan.iptype='ipv4'
+# the first activation after samsungipcd starts can fail while the modem
+# re-registers: retry instead of giving up
+set network.wwan.force_connection='1'
 commit network
 EOT
 

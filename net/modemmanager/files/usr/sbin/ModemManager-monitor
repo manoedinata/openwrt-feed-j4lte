@@ -70,10 +70,9 @@ mm_monitor_cache_add() {
 	}
 
 	sysfspath=$(modemmanager_get_field "${modemstatus}" "modem.generic.physdev")
-	[ -n "${sysfspath}" ] || {
-		mm_log "err" "No 'sysfspath' for object '$object' not found..."
-		return 2
-	}
+	# modems made of virtual ports (e.g. samsungipcd's pty and rmnet) have
+	# no physical device; their device id is what the interface names
+	[ -n "${sysfspath}" ] || sysfspath="${device}"
 
 	mm_log "debug" "add object '$object' to monitore cache (device=${device},sysfspath=${sysfspath})"
 

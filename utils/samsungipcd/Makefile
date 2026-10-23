@@ -5,7 +5,7 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=samsungipcd
 PKG_SOURCE_DATE:=2026-10-23
 PKG_SOURCE_VERSION:=7165a7481ac1a943f73e32f39e3e2d50e5507d5c
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/manoedinata/samsungipcd.git
