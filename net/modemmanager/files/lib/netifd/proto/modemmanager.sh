@@ -733,7 +733,21 @@ proto_modemmanager_setup() {
 	append_param "${username:+user=${username}}"
 	append_param "${password:+password=${password}}"
 
-	mmcli --modem="${device}" --timeout 120 --simple-connect="${connectargs}" || {
+	# the first connect after the modem comes up can fail (samsungipcd: the
+	# first PDP activation fails while the modem re-registers), and netifd
+	# does not always come back for MM_INTERFACE_RESTART: retry here first
+	local connect_try connected=0
+	for connect_try in 1 2 3; do
+		mmcli --modem="${device}" --timeout 120 --simple-connect="${connectargs}" && {
+			connected=1
+			break
+		}
+		[ "${connect_try}" -lt 3 ] && {
+			echo "connection attempt ${connect_try} failed, retrying"
+			sleep 5
+		}
+	done
+	[ "${connected}" -eq 1 ] || {
 		if [ -n "${force_connection}" ] && [ "${force_connection}" -eq 1 ]; then
 			echo "Connection failed -> attempting restart"
 			proto_notify_error "${interface}" MM_INTERFACE_RESTART

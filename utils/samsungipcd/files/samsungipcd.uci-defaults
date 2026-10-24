@@ -11,6 +11,8 @@ set network.wwan.proto='modemmanager'
 set network.wwan.device='samsungipcd'
 set network.wwan.apn='internet'
 set network.wwan.iptype='ipv4'
+# a WiFi uplink (metric 0) goes first, mobile data is the fallback
+set network.wwan.metric='20'
 # the first activation after samsungipcd starts can fail while the modem
 # re-registers: retry instead of giving up
 set network.wwan.force_connection='1'
