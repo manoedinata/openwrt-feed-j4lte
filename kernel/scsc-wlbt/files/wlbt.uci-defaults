@@ -1,0 +1,15 @@
+#!/bin/sh
+# The WLBT firmware (S610) is 2.4 GHz only, but the driver registers a 5 GHz
+# band until the firmware first runs, so wifi detection can pick 5g/VHT80.
+
+radios=$(uci -q show wireless | sed -n "s/^wireless\.\([^.]*\)\.path='platform\/soc@0\/10580000\.wlbt'$/\1/p")
+
+for r in $radios; do
+	[ "$(uci -q get "wireless.$r.band")" = 2g ] && continue
+	uci set "wireless.$r.band=2g"
+	uci set "wireless.$r.channel=auto"
+	uci set "wireless.$r.htmode=HT20"
+done
+[ -n "$radios" ] && uci commit wireless
+
+exit 0

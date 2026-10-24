@@ -1,0 +1,38 @@
+#!/bin/sh /etc/rc.common
+# WLBT WiFi: the firmware and the MAC address stay on the phone's own
+# partitions (not redistributable); mount them read-only before netifd
+# (START=20) brings the radio up and the driver reads them.
+
+START=19
+
+# block device of the partition with the given GPT name
+part_by_name() {
+	local u
+	for u in /sys/class/block/*/uevent; do
+		grep -qx "PARTNAME=$1" "$u" && { echo "/dev/$(basename "$(dirname "$u")")"; return 0; }
+	done
+	return 1
+}
+
+# mount_ro <partition name> <mount point>, unless it is mounted already
+mount_ro() {
+	local dev
+
+	grep -q " $2 " /proc/mounts && return 0
+	dev=$(part_by_name "$1") || return 1
+	mkdir -p "$2" && mount -t ext4 -o ro "$dev" "$2"
+}
+
+start() {
+	# MAC address: /efs/wifi/.mac.info (EFS is never mounted rw)
+	mount_ro EFS /efs
+
+	# firmware: CONFIG_SCSC_CORE_FW_LOCATION is /lib/firmware/scsc; a copy
+	# placed there by hand wins over VENDOR's /etc/wifi
+	if [ ! -e /lib/firmware/scsc ]; then
+		mount_ro VENDOR /vendor && [ -d /vendor/etc/wifi ] && \
+			mkdir -p /lib/firmware && ln -s /vendor/etc/wifi /lib/firmware/scsc
+	elif [ -L /lib/firmware/scsc ]; then
+		mount_ro VENDOR /vendor
+	fi
+}
