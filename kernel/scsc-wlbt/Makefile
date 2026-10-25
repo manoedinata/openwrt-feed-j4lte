@@ -87,7 +87,7 @@ define Build/Compile
 		CONFIG_SCSC_WLAN=m CONFIG_SCSC_WLAN_MAX_INTERFACES=3 \
 		NOSTDINC_FLAGS="$(NOSTDINC_FLAGS)" \
 		KCFLAGS="-include $(PKG_BUILD_DIR)/scsc-config.h" \
-		KBUILD_EXTRA_SYMBOLS="$(wildcard $(PKG_SYMVERS_DIR)/*.symvers) $(PKG_BUILD_DIR)/core/Module.symvers" \
+		KBUILD_EXTRA_SYMBOLS="$(filter-out $(PKG_SYMVERS_DIR)/$(PKG_NAME).symvers,$(wildcard $(PKG_SYMVERS_DIR)/*.symvers)) $(PKG_BUILD_DIR)/core/Module.symvers" \
 		modules
 endef
 
