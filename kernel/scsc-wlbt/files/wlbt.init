@@ -1,9 +1,10 @@
 #!/bin/sh /etc/rc.common
 # WLBT WiFi: the firmware and the MAC address stay on the phone's own
-# partitions (not redistributable); mount them read-only before netifd
-# (START=20) brings the radio up and the driver reads them.
+# partitions (not redistributable); mount them read-only before boot
+# (START=10) loads the drivers: scsc_wlan reads the MAC address when it
+# attaches, and user space takes the interface addresses from it.
 
-START=19
+START=09
 
 # block device of the partition with the given GPT name
 part_by_name() {
