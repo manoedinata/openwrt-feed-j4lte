@@ -11,6 +11,7 @@ used together with the `exynos7570` target in
 | `utils/samsungipcd` | boots the modem, serves an AT port on `/dev/ptyp0` (`ttyp0`) for ModemManager, data on `rmnet0`; procd service, ModemManager rules, a `wwan` interface on first boot |
 | `net/modemmanager` | OpenWrt's ModemManager 1.24 package plus the `samsungipcd` plugin (`patches/0100-plugins-add-samsungipcd.patch`) and a default route for gateway-less point-to-point bearers |
 | `kernel/scsc-wlbt` | the WLBT WiFi drivers (SCSC maxwell core + WLAN, from the target's kernel patches) built against the mac80211 backports cfg80211: `kmod-scsc-core`, `kmod-scsc-wlan` (autoloaded; `/etc/init.d/wlbt` mounts EFS/VENDOR read-only for the MAC and firmware, radio kept on 2.4 GHz) |
+| `luci/luci-app-j4-battery` | battery and charger state from `/sys/class/power_supply` on the LuCI status page (level, status, voltage, current, temperature, health, charger), with the rpcd ACL for those files |
 
 Use it in an OpenWrt tree with
 

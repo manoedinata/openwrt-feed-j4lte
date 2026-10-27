@@ -1,0 +1,12 @@
+{
+	"luci-app-j4-battery": {
+		"description": "Grant access to the power_supply class",
+		"read": {
+			"file": {
+				"/sys/class/power_supply": [ "list" ],
+				"/sys/class/power_supply/*/uevent": [ "read" ],
+				"/sys/devices/*/power_supply/*/uevent": [ "read" ]
+			}
+		}
+	}
+}
